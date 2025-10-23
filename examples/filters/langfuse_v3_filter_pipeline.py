@@ -11,7 +11,6 @@ requirements: langfuse>=3.0.0
 from typing import List, Optional
 import os
 import uuid
-import json
 
 
 from utils.pipelines.main import get_last_assistant_message
@@ -90,6 +89,12 @@ class Pipeline:
                 self.log("Langfuse data flushed on shutdown")
             except Exception as e:
                 self.log(f"Failed to flush Langfuse data: {e}")
+            try:
+                # Ensure graceful shutdown of background threads
+                self.langfuse.shutdown()
+                self.log("Langfuse client shutdown completed")
+            except Exception as e:
+                self.log(f"Failed to shutdown Langfuse client: {e}")
 
     async def on_valves_updated(self):
         self.log("Valves updated, resetting Langfuse client.")
@@ -99,10 +104,24 @@ class Pipeline:
         try:
             self.log(f"Initializing Langfuse with host: {self.valves.host}")
             self.log(
-                f"Secret key set: {'Yes' if self.valves.secret_key and self.valves.secret_key != 'your-secret-key-here' else 'No'}"
+                (
+                    "Secret key set: "
+                    + (
+                        "Yes"
+                        if self.valves.secret_key and self.valves.secret_key != 'your-secret-key-here'
+                        else "No"
+                    )
+                )
             )
             self.log(
-                f"Public key set: {'Yes' if self.valves.public_key and self.valves.public_key != 'your-public-key-here' else 'No'}"
+                (
+                    "Public key set: "
+                    + (
+                        "Yes"
+                        if self.valves.public_key and self.valves.public_key != 'your-public-key-here'
+                        else "No"
+                    )
+                )
             )
 
             # Initialize Langfuse client for v3.2.1
@@ -113,17 +132,24 @@ class Pipeline:
                 debug=self.valves.debug,
             )
 
-            # Test authentication
-            try:
-                self.langfuse.auth_check()
+            # Test authentication (run only in debug mode to avoid extra latency in production)
+            if self.valves.debug:
+                try:
+                    self.langfuse.auth_check()
+                    self.log(
+                        "Langfuse client initialized and authenticated successfully. "
+                        f"Connected to host: {self.valves.host}"
+                    )
+                except Exception as e:
+                    self.log(f"Auth check failed: {e}")
+                    self.log(f"Failed host: {self.valves.host}")
+                    self.langfuse = None
+                    return
+            else:
                 self.log(
-                    f"Langfuse client initialized and authenticated successfully. Connected to host: {self.valves.host}")
-
-            except Exception as e:
-                self.log(f"Auth check failed: {e}")
-                self.log(f"Failed host: {self.valves.host}")
-                self.langfuse = None
-                return
+                    "Langfuse client initialized (auth_check skipped in non-debug). "
+                    f"Connected to host: {self.valves.host}"
+                )
 
         except Exception as auth_error:
             if (
@@ -308,24 +334,24 @@ class Pipeline:
             # Re-run inlet to register if somehow missing
             return await self.inlet(body, user)
 
-        self.chat_traces[chat_id]
+        # Ensure dict access does not become a no-op
+        _ = self.chat_traces[chat_id]
 
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        usage = None
+        usage_details = None
         if assistant_message_obj:
             info = assistant_message_obj.get("usage", {})
             if isinstance(info, dict):
                 input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
                 output_tokens = info.get("eval_count") or info.get("completion_tokens")
                 if input_tokens is not None and output_tokens is not None:
-                    usage = {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "unit": "TOKENS",
+                    usage_details = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
                     }
-                    self.log(f"Usage data extracted: {usage}")
+                    self.log(f"Usage data extracted: {usage_details}")
 
         # Update the trace with complete output information
         trace = self.chat_traces[chat_id]
@@ -368,7 +394,6 @@ class Pipeline:
         # Create LLM generation for the response
         try:
             trace = self.chat_traces[chat_id]
-            
             # Create complete generation metadata
             generation_metadata = {
                 **complete_trace_metadata,
@@ -377,7 +402,6 @@ class Pipeline:
                 "model_name": model_name,
                 "generation_id": str(uuid.uuid4()),
             }
-            
             generation = trace.start_generation(
                 name=f"llm_response:{str(uuid.uuid4())}",
                 model=model_value,
@@ -385,11 +409,9 @@ class Pipeline:
                 output=assistant_message,
                 metadata=generation_metadata,
             )
-
-            # Update with usage if available
-            if usage:
-                generation.update(usage=usage)
-
+            # Update with usage details if available
+            if usage_details:
+                generation.update(usage_details=usage_details)
             generation.end()
             self.log(f"LLM generation completed for chat_id: {chat_id}")
         except Exception as e:
