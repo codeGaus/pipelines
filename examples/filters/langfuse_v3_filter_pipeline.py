@@ -37,6 +37,8 @@ class Pipeline:
         insert_tags: bool = True
         # New valve that controls whether to use model name instead of model ID for generation
         use_model_name_instead_of_id_for_generation: bool = False
+        # New valve to end root trace after each outlet to ensure immediate visibility in UI
+        end_trace_each_turn: bool = True
         debug: bool = False
 
     def __init__(self):
@@ -50,6 +52,7 @@ class Pipeline:
                 "public_key": os.getenv("LANGFUSE_PUBLIC_KEY", "your-public-key-here"),
                 "host": os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
                 "use_model_name_instead_of_id_for_generation": os.getenv("USE_MODEL_NAME", "false").lower() == "true",
+                "end_trace_each_turn": os.getenv("END_TRACE_EACH_TURN", "true").lower() == "true",
                 "debug": os.getenv("DEBUG_MODE", "false").lower() == "true",
             }
         )
@@ -422,6 +425,17 @@ class Pipeline:
             if self.langfuse:
                 self.langfuse.flush()
                 self.log("Langfuse data flushed")
+                # Optionally end the root span per chat turn to make traces appear immediately
+                if self.valves.end_trace_each_turn:
+                    try:
+                        root = self.chat_traces.get(chat_id)
+                        if root:
+                            root.end()
+                            self.log(f"Ended root span for chat_id: {chat_id}")
+                            # Remove closed trace from cache; will be recreated on next inlet
+                            self.chat_traces.pop(chat_id, None)
+                    except Exception as e:
+                        self.log(f"Failed to end root span after flush: {e}")
         except Exception as e:
             self.log(f"Failed to flush Langfuse data: {e}")
 
