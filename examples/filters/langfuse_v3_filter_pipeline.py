@@ -2,9 +2,9 @@
 title: Langfuse Filter Pipeline for v3
 author: open-webui
 date: 2025-07-31
-version: 0.2.0
+version: 0.3.0
 license: MIT
-description: A filter pipeline that uses Langfuse v3 SDK with manual span management.
+description: A filter pipeline that uses Langfuse v3 SDK with trace_context approach.
 requirements: langfuse>=3.0.0
 """
 
@@ -52,8 +52,8 @@ class Pipeline:
         )
 
         self.langfuse = None
-        # Store root span objects (traces) - they should NOT be ended until chat is done
-        self.chat_root_spans: Dict[str, any] = {}
+        # Store trace IDs for each chat (not span objects!)
+        self.chat_trace_ids: Dict[str, str] = {}
         self.suppressed_logs = set()
         # Dictionary to store model names for each chat
         self.model_names = {}
@@ -74,15 +74,6 @@ class Pipeline:
         self.log(f"on_shutdown triggered for {__name__}")
         if self.langfuse:
             try:
-                # End all root spans (traces)
-                for chat_id, root_span in list(self.chat_root_spans.items()):
-                    try:
-                        root_span.end()
-                        self.log(f"Ended root span for chat_id: {chat_id}")
-                    except Exception as e:
-                        self.log(f"Failed to end root span for {chat_id}: {e}")
-                
-                self.chat_root_spans.clear()
                 self.langfuse.flush()
                 self.log("Langfuse data flushed on shutdown")
             except Exception as e:
@@ -167,42 +158,49 @@ class Pipeline:
         task_name = metadata.get("task", "user_response")
         tags_list = self._build_tags(task_name)
 
-        # Create root span (trace) ONCE per chat and keep it open
-        if chat_id not in self.chat_root_spans:
-            self.log(f"Creating new root span (trace) for chat_id: {chat_id}")
-
+        # Create or get trace_id
+        if chat_id not in self.chat_trace_ids:
+            # Generate a deterministic trace ID for this chat
+            trace_id = Langfuse.create_trace_id(seed=f"chat-{chat_id}")
+            self.chat_trace_ids[chat_id] = trace_id
+            self.log(f"Created new trace_id: {trace_id} for chat_id: {chat_id}")
+            
+            # Create initial root span to initialize the trace
+            # This span will be ended immediately after setting trace attributes
             try:
-                # Create root span using start_span (manual - no context manager)
-                # This span represents the entire chat and should NOT be ended until chat is done
-                root_span = self.langfuse.start_span(
+                with self.langfuse.start_as_current_span(
                     name=f"chat:{chat_id}",
                     input=body,
-                )
-                
-                # Set trace-level attributes
-                root_span.update_trace(
-                    user_id=user_email,
-                    session_id=chat_id,
-                    tags=tags_list if tags_list else None,
-                    metadata={
-                        **metadata,
-                        "interface": "open-webui",
-                    },
-                )
-                
-                self.chat_root_spans[chat_id] = root_span
-                self.log(f"Successfully created root span: {root_span.id}")
+                    trace_context={"trace_id": trace_id}
+                ) as root_span:
+                    # Set trace-level attributes
+                    root_span.update_trace(
+                        user_id=user_email,
+                        session_id=chat_id,
+                        tags=tags_list if tags_list else None,
+                        metadata={
+                            **metadata,
+                            "interface": "open-webui",
+                        },
+                    )
+                # Span is automatically ended when exiting context manager
+                self.log(f"Root span created and ended for trace: {trace_id}")
             except Exception as e:
                 self.log(f"Failed to create root span: {e}")
                 return body
         else:
-            # Update existing root span with new tags if needed
-            root_span = self.chat_root_spans[chat_id]
+            # Trace already exists, just update tags if needed
+            trace_id = self.chat_trace_ids[chat_id]
             if tags_list:
                 try:
-                    root_span.update_trace(tags=tags_list)
+                    # Create a quick span to update trace
+                    with self.langfuse.start_as_current_span(
+                        name="trace-update",
+                        trace_context={"trace_id": trace_id}
+                    ) as span:
+                        span.update_trace(tags=tags_list)
                 except Exception as e:
-                    self.log(f"Failed to update root span tags: {e}")
+                    self.log(f"Failed to update trace tags: {e}")
 
         return body
 
@@ -220,11 +218,11 @@ class Pipeline:
             session_id = body.get("session_id")
             chat_id = f"temporary-session-{session_id}"
 
-        if chat_id not in self.chat_root_spans:
-            self.log(f"[WARNING] No matching root span found for chat_id: {chat_id}")
+        if chat_id not in self.chat_trace_ids:
+            self.log(f"[WARNING] No matching trace_id found for chat_id: {chat_id}")
             return body
 
-        root_span = self.chat_root_spans[chat_id]
+        trace_id = self.chat_trace_ids[chat_id]
         metadata = body.get("metadata", {})
         task_name = metadata.get("task", "llm_response")
         tags_list = self._build_tags(task_name)
@@ -246,13 +244,7 @@ class Pipeline:
                     }
                     self.log(f"Usage data extracted: {usage_details}")
 
-        # Update root span (trace) output
-        try:
-            root_span.update_trace(output=assistant_message)
-        except Exception as e:
-            self.log(f"Failed to update root span output: {e}")
-
-        # Create LLM generation as child of root span
+        # Create LLM generation span within the same trace
         try:
             model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
             model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
@@ -271,28 +263,28 @@ class Pipeline:
                 "model_name": model_name,
             }
             
-            # Create generation as child of root span
-            # Use start_generation on root span, then end it immediately
-            generation = root_span.start_generation(
+            # Create generation within the trace using context manager
+            with self.langfuse.start_as_current_generation(
                 name=f"llm_response:{str(uuid.uuid4())}",
                 model=model_value,
                 input=body["messages"],
                 output=assistant_message,
                 metadata=generation_metadata,
-            )
-            
-            # Update with usage details if available
-            if usage_details:
-                generation.update(usage_details=usage_details)
-            
-            # End the generation immediately
-            generation.end()
-            
-            self.log(f"LLM generation created and ended for chat_id: {chat_id}")
+                trace_context={"trace_id": trace_id}
+            ) as generation:
+                # Update with usage details if available
+                if usage_details:
+                    generation.update(usage_details=usage_details)
+                
+                # Update trace output
+                generation.update_trace(output=assistant_message)
+                
+            # Generation is automatically ended when exiting context manager
+            self.log(f"LLM generation created and ended for trace: {trace_id}")
         except Exception as e:
             self.log(f"Failed to create LLM generation: {e}")
 
-        # Flush data
+        # Flush data immediately
         try:
             self.langfuse.flush()
             self.log("Langfuse data flushed")
