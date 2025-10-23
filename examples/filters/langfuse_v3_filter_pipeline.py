@@ -2,13 +2,13 @@
 title: Langfuse Filter Pipeline for v3
 author: open-webui
 date: 2025-07-31
-version: 0.0.1
+version: 0.2.0
 license: MIT
-description: A filter pipeline that uses Langfuse v3.
+description: A filter pipeline that uses Langfuse v3 SDK with manual span management.
 requirements: langfuse>=3.0.0
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 import uuid
 
@@ -32,15 +32,13 @@ class Pipeline:
         secret_key: str
         public_key: str
         host: str
-        # New valve that controls whether task names are added as tags:
         insert_tags: bool = True
-        # New valve that controls whether to use model name instead of model ID for generation
         use_model_name_instead_of_id_for_generation: bool = False
         debug: bool = False
 
     def __init__(self):
         self.type = "filter"
-        self.name = "Langfuse Filter"
+        self.name = "Langfuse Filter v3"
 
         self.valves = self.Valves(
             **{
@@ -54,7 +52,8 @@ class Pipeline:
         )
 
         self.langfuse = None
-        self.chat_traces = {}
+        # Store root span objects (traces) - they should NOT be ended until chat is done
+        self.chat_root_spans: Dict[str, any] = {}
         self.suppressed_logs = set()
         # Dictionary to store model names for each chat
         self.model_names = {}
@@ -75,15 +74,15 @@ class Pipeline:
         self.log(f"on_shutdown triggered for {__name__}")
         if self.langfuse:
             try:
-                # End all active traces
-                for chat_id, trace in self.chat_traces.items():
+                # End all root spans (traces)
+                for chat_id, root_span in list(self.chat_root_spans.items()):
                     try:
-                        trace.end()
-                        self.log(f"Ended trace for chat_id: {chat_id}")
+                        root_span.end()
+                        self.log(f"Ended root span for chat_id: {chat_id}")
                     except Exception as e:
-                        self.log(f"Failed to end trace for {chat_id}: {e}")
-
-                self.chat_traces.clear()
+                        self.log(f"Failed to end root span for {chat_id}: {e}")
+                
+                self.chat_root_spans.clear()
                 self.langfuse.flush()
                 self.log("Langfuse data flushed on shutdown")
             except Exception as e:
@@ -96,14 +95,7 @@ class Pipeline:
     def set_langfuse(self):
         try:
             self.log(f"Initializing Langfuse with host: {self.valves.host}")
-            self.log(
-                f"Secret key set: {'Yes' if self.valves.secret_key and self.valves.secret_key != 'your-secret-key-here' else 'No'}"
-            )
-            self.log(
-                f"Public key set: {'Yes' if self.valves.public_key and self.valves.public_key != 'your-public-key-here' else 'No'}"
-            )
-
-            # Initialize Langfuse client for v3.2.1
+            
             self.langfuse = Langfuse(
                 secret_key=self.valves.secret_key,
                 public_key=self.valves.public_key,
@@ -114,38 +106,21 @@ class Pipeline:
             # Test authentication
             try:
                 self.langfuse.auth_check()
-                self.log(
-                    f"Langfuse client initialized and authenticated successfully. Connected to host: {self.valves.host}")
-
+                self.log(f"Langfuse client initialized and authenticated successfully")
             except Exception as e:
                 self.log(f"Auth check failed: {e}")
-                self.log(f"Failed host: {self.valves.host}")
                 self.langfuse = None
                 return
 
-        except Exception as auth_error:
-            if (
-                "401" in str(auth_error)
-                or "unauthorized" in str(auth_error).lower()
-                or "credentials" in str(auth_error).lower()
-            ):
-                self.log(f"Langfuse credentials incorrect: {auth_error}")
-                self.langfuse = None
-                return
         except Exception as e:
             self.log(f"Langfuse initialization error: {e}")
             self.langfuse = None
 
     def _build_tags(self, task_name: str) -> list:
-        """
-        Builds a list of tags based on valve settings, ensuring we always add
-        'open-webui' and skip user_response / llm_response from becoming tags themselves.
-        """
+        """Build tags list based on valve settings."""
         tags_list = []
         if self.valves.insert_tags:
-            # Always add 'open-webui'
             tags_list.append("open-webui")
-            # Add the task_name if it's not one of the excluded defaults
             if task_name not in ["user_response", "llm_response"]:
                 tags_list.append(task_name)
         return tags_list
@@ -153,12 +128,9 @@ class Pipeline:
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         self.log("Langfuse Filter INLET called")
 
-        # Check Langfuse client status
         if not self.langfuse:
             self.log("[WARNING] Langfuse client not initialized - Skipped")
             return body
-
-        self.log(f"Inlet function called with body: {body} and user: {user}")
 
         metadata = body.get("metadata", {})
         chat_id = metadata.get("chat_id", str(uuid.uuid4()))
@@ -171,11 +143,10 @@ class Pipeline:
         metadata["chat_id"] = chat_id
         body["metadata"] = metadata
 
-        # Extract and store both model name and ID if available
+        # Extract and store model information
         model_info = metadata.get("model", {})
         model_id = body.get("model")
         
-        # Store model information for this chat
         if chat_id not in self.model_names:
             self.model_names[chat_id] = {"id": model_id}
         else:
@@ -183,7 +154,7 @@ class Pipeline:
             
         if isinstance(model_info, dict) and "name" in model_info:
             self.model_names[chat_id]["name"] = model_info["name"]
-            self.log(f"Stored model info - name: '{model_info['name']}', id: '{model_id}' for chat_id: {chat_id}")
+            self.log(f"Stored model info - name: '{model_info['name']}', id: '{model_id}'")
 
         required_keys = ["model", "messages"]
         missing_keys = [key for key in required_keys if key not in body]
@@ -193,99 +164,54 @@ class Pipeline:
             raise ValueError(error_message)
 
         user_email = user.get("email") if user else None
-        # Defaulting to 'user_response' if no task is provided
         task_name = metadata.get("task", "user_response")
-
-        # Build tags
         tags_list = self._build_tags(task_name)
 
-        if chat_id not in self.chat_traces:
-            self.log(f"Creating new trace for chat_id: {chat_id}")
+        # Create root span (trace) ONCE per chat and keep it open
+        if chat_id not in self.chat_root_spans:
+            self.log(f"Creating new root span (trace) for chat_id: {chat_id}")
 
             try:
-                # Create trace using Langfuse v3 API with complete data
-                trace_metadata = {
-                    **metadata,
-                    "user_id": user_email,
-                    "session_id": chat_id,
-                    "interface": "open-webui",
-                }
-                
-                # Create trace with all necessary information
-                trace = self.langfuse.start_span(
+                # Create root span using start_span (manual - no context manager)
+                # This span represents the entire chat and should NOT be ended until chat is done
+                root_span = self.langfuse.start_span(
                     name=f"chat:{chat_id}",
                     input=body,
-                    metadata=trace_metadata
                 )
-
-                # Set additional trace attributes
-                trace.update_trace(
+                
+                # Set trace-level attributes
+                root_span.update_trace(
                     user_id=user_email,
                     session_id=chat_id,
                     tags=tags_list if tags_list else None,
-                    input=body,
-                    metadata=trace_metadata,
+                    metadata={
+                        **metadata,
+                        "interface": "open-webui",
+                    },
                 )
-
-                self.chat_traces[chat_id] = trace
-                self.log(f"Successfully created trace for chat_id: {chat_id}")
+                
+                self.chat_root_spans[chat_id] = root_span
+                self.log(f"Successfully created root span: {root_span.id}")
             except Exception as e:
-                self.log(f"Failed to create trace: {e}")
+                self.log(f"Failed to create root span: {e}")
                 return body
         else:
-            trace = self.chat_traces[chat_id]
-            self.log(f"Reusing existing trace for chat_id: {chat_id}")
-            # Update trace with current metadata and tags
-            trace_metadata = {
-                **metadata,
-                "user_id": user_email,
-                "session_id": chat_id,
-                "interface": "open-webui",
-            }
-            trace.update_trace(
-                tags=tags_list if tags_list else None,
-                metadata=trace_metadata,
-            )
-
-        # Update metadata with type
-        metadata["type"] = task_name
-        metadata["interface"] = "open-webui"
-
-        # Log user input as event
-        try:
-            trace = self.chat_traces[chat_id]
-            
-            # Create complete event metadata
-            event_metadata = {
-                **metadata,
-                "type": "user_input",
-                "interface": "open-webui",
-                "user_id": user_email,
-                "session_id": chat_id,
-                "event_id": str(uuid.uuid4()),
-            }
-            
-            event_span = trace.start_span(
-                name=f"user_input:{str(uuid.uuid4())}",
-                metadata=event_metadata,
-                input=body["messages"],
-            )
-            event_span.end()
-            self.log(f"User input event logged for chat_id: {chat_id}")
-        except Exception as e:
-            self.log(f"Failed to log user input event: {e}")
+            # Update existing root span with new tags if needed
+            root_span = self.chat_root_spans[chat_id]
+            if tags_list:
+                try:
+                    root_span.update_trace(tags=tags_list)
+                except Exception as e:
+                    self.log(f"Failed to update root span tags: {e}")
 
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         self.log("Langfuse Filter OUTLET called")
 
-        # Check Langfuse client status
         if not self.langfuse:
             self.log("[WARNING] Langfuse client not initialized - Skipped")
             return body
-
-        self.log(f"Outlet function called with body: {body}")
 
         chat_id = body.get("chat_id")
 
@@ -294,17 +220,14 @@ class Pipeline:
             session_id = body.get("session_id")
             chat_id = f"temporary-session-{session_id}"
 
+        if chat_id not in self.chat_root_spans:
+            self.log(f"[WARNING] No matching root span found for chat_id: {chat_id}")
+            return body
+
+        root_span = self.chat_root_spans[chat_id]
         metadata = body.get("metadata", {})
-        # Defaulting to 'llm_response' if no task is provided
         task_name = metadata.get("task", "llm_response")
-
-        # Build tags
         tags_list = self._build_tags(task_name)
-
-        if chat_id not in self.chat_traces:
-            self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
-            # Re-run inlet to register if somehow missing
-            return await self.inlet(body, user)
 
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
@@ -323,79 +246,56 @@ class Pipeline:
                     }
                     self.log(f"Usage data extracted: {usage_details}")
 
-        # Update the trace with complete output information
-        trace = self.chat_traces[chat_id]
-        
-        metadata["type"] = task_name
-        metadata["interface"] = "open-webui"
-        
-        # Create complete trace metadata with all information
-        complete_trace_metadata = {
-            **metadata,
-            "user_id": user.get("email") if user else None,
-            "session_id": chat_id,
-            "interface": "open-webui",
-            "task": task_name,
-        }
-        
-        # Update trace with output and complete metadata
-        trace.update_trace(
-            output=assistant_message,
-            metadata=complete_trace_metadata,
-            tags=tags_list if tags_list else None,
-        )
-
-        # Outlet: Always create LLM generation (this is the LLM response)
-        # Determine which model value to use based on the use_model_name valve
-        model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
-        model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
-
-        # Pick primary model identifier based on valve setting
-        model_value = (
-            model_name
-            if self.valves.use_model_name_instead_of_id_for_generation
-            else model_id
-        )
-
-        # Add both values to metadata regardless of valve setting
-        metadata["model_id"] = model_id
-        metadata["model_name"] = model_name
-
-        # Create LLM generation for the response
+        # Update root span (trace) output
         try:
-            trace = self.chat_traces[chat_id]
+            root_span.update_trace(output=assistant_message)
+        except Exception as e:
+            self.log(f"Failed to update root span output: {e}")
+
+        # Create LLM generation as child of root span
+        try:
+            model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
+            model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
             
-            # Create complete generation metadata
+            model_value = (
+                model_name
+                if self.valves.use_model_name_instead_of_id_for_generation
+                else model_id
+            )
+
             generation_metadata = {
-                **complete_trace_metadata,
+                **metadata,
                 "type": "llm_response",
+                "interface": "open-webui",
                 "model_id": model_id,
                 "model_name": model_name,
-                "generation_id": str(uuid.uuid4()),
             }
             
-            generation = trace.start_generation(
+            # Create generation as child of root span
+            # Use start_generation on root span, then end it immediately
+            generation = root_span.start_generation(
                 name=f"llm_response:{str(uuid.uuid4())}",
                 model=model_value,
                 input=body["messages"],
                 output=assistant_message,
                 metadata=generation_metadata,
             )
-
-            # Update with usage details if available (Langfuse v3 format)
+            
+            # Update with usage details if available
             if usage_details:
                 generation.update(usage_details=usage_details)
-
+            
+            # End the generation immediately
             generation.end()
-            self.log(f"LLM generation completed for chat_id: {chat_id}")
+            
+            self.log(f"LLM generation created and ended for chat_id: {chat_id}")
         except Exception as e:
             self.log(f"Failed to create LLM generation: {e}")
 
-        # Flush data to Langfuse
+        # Flush data
         try:
-            if self.langfuse:
-                self.langfuse.flush()
-                self.log("Langfuse data flushed")
+            self.langfuse.flush()
+            self.log("Langfuse data flushed")
         except Exception as e:
             self.log(f"Failed to flush Langfuse data: {e}")
 
