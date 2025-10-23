@@ -11,8 +11,6 @@ requirements: langfuse>=3.0.0
 from typing import List, Optional
 import os
 import uuid
-import json
-
 
 from utils.pipelines.main import get_last_assistant_message
 from pydantic import BaseModel
@@ -308,24 +306,22 @@ class Pipeline:
             # Re-run inlet to register if somehow missing
             return await self.inlet(body, user)
 
-        self.chat_traces[chat_id]
-
         assistant_message = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
 
-        usage = None
+        # Extract usage details in Langfuse v3 format
+        usage_details = None
         if assistant_message_obj:
             info = assistant_message_obj.get("usage", {})
             if isinstance(info, dict):
                 input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
                 output_tokens = info.get("eval_count") or info.get("completion_tokens")
                 if input_tokens is not None and output_tokens is not None:
-                    usage = {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "unit": "TOKENS",
+                    usage_details = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
                     }
-                    self.log(f"Usage data extracted: {usage}")
+                    self.log(f"Usage data extracted: {usage_details}")
 
         # Update the trace with complete output information
         trace = self.chat_traces[chat_id]
@@ -386,9 +382,9 @@ class Pipeline:
                 metadata=generation_metadata,
             )
 
-            # Update with usage if available
-            if usage:
-                generation.update(usage=usage)
+            # Update with usage details if available (Langfuse v3 format)
+            if usage_details:
+                generation.update(usage_details=usage_details)
 
             generation.end()
             self.log(f"LLM generation completed for chat_id: {chat_id}")
